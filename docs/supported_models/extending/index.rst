@@ -10,3 +10,4 @@ Adding new models and alternative backends.
    transformers_fallback.md
    modelscope.md
    mindspore_models.md
+   atom_models.md

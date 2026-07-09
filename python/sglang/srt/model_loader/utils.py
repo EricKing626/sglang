@@ -102,6 +102,8 @@ def _model_impl_from_architecture(architecture: str) -> ModelImpl:
         return ModelImpl.TRANSFORMERS
     if architecture.startswith("MindSpore"):
         return ModelImpl.MINDSPORE
+    if architecture.startswith("ATOM"):
+        return ModelImpl.ATOM
     return ModelImpl.SGLANG
 
 
@@ -218,6 +220,8 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
 
     if model_config.model_impl == ModelImpl.MINDSPORE:
         architectures = ["MindSporeForCausalLM"]
+    elif model_config.model_impl == ModelImpl.ATOM:
+        architectures = ["ATOMForCausalLM"]
     elif not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
     model_cls, resolved_arch = ModelRegistry.resolve_model_cls(architectures)
