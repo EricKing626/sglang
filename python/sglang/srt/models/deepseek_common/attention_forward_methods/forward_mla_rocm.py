@@ -326,15 +326,18 @@ class DeepseekMLARocmForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = self.kv_a_layernorm(k_nope)
-                current_stream.wait_stream(self.alt_stream)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
+            # NOTE(perf): the aiter fused RMSNorm(+quant) kernels below compute
+            # q and k_nope in ONE kernel, which strictly beats splitting the two
+            # unfused layernorms across two streams. They must therefore be tried
+            # BEFORE the alt_stream path. The CUDA sibling file (forward_mla.py)
+            # puts the alt_stream branch first because it has no fused kernel to
+            # fall back on; copying that order here silently de-fused this whole
+            # chain whenever SGLANG_ROCM_USE_MULTI_STREAM=1 was set, replacing
+            # aiter::fused_qk_rmsnorm (1.7 ms/decode-step on MI355X, GLM-5.2 FP4
+            # isl8192/osl1024/c64) with 2x add_rmsnorm_quant (2.9 ms) plus an
+            # elementwise pass (3.4 ms) -- a net +4.6 ms of extra kernel work for
+            # ~0.4 ms of overlap.
+            if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 q, _, k_nope, *_ = fused_rms_mxfp4_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -386,6 +389,15 @@ class DeepseekMLARocmForwardMixin:
                     self.kv_a_layernorm.weight,
                     self.kv_a_layernorm.variance_epsilon,
                 )
+            elif self.alt_stream is not None and get_is_capture_mode():
+                # overlap qk norm -- only reachable when no fused aiter RMSNorm
+                # kernel applies to this weight dtype.
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                q = self.q_a_layernorm(q)
+                with torch.cuda.stream(self.alt_stream):
+                    k_nope = self.kv_a_layernorm(k_nope)
+                current_stream.wait_stream(self.alt_stream)
             else:
                 q = self.q_a_layernorm(q)
                 k_nope = self.kv_a_layernorm(k_nope)
