@@ -137,7 +137,7 @@ __device__ __forceinline__ void suffix_scan_coarse(int* h, int tx) {
   int suf = total;
 #pragma unroll
   for (int d = 1; d < kWaveSize; d <<= 1) {
-    const int y = __shfl_down(suf, d);
+    const int y = __shfl_down_sync(0xffffffffu, suf, d);
     if (lane + d < kWaveSize) suf += y;
   }
   if (lane == 0) s_wave_total[wave] = suf;
