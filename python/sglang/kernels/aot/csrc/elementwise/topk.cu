@@ -87,6 +87,24 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+#ifdef USE_ROCM
+// Elements each thread loads per trip of the two full-length loops below.
+//
+// This is where the kernel's time goes. Both loops are a dependent chain of
+// load -> classify -> LDS atomic, and the grid is one block per row, so at
+// batch 64 only 64 of 256 CUs are occupied and there is no other work resident
+// to hide the load latency behind. Issuing a couple of loads before consuming
+// either of them fills that gap; 2 measured best on gfx950, 4 and 8 spend the
+// registers without buying more overlap.
+constexpr int kUnroll = 2;
+
+#ifdef __AMDGCN_WAVEFRONT_SIZE
+constexpr int kWaveSize = __AMDGCN_WAVEFRONT_SIZE;
+#else
+constexpr int kWaveSize = 64;
+#endif
+#endif  // USE_ROCM
+
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   // An optimized topk kernel copied from tilelang kernel
   // We assume length > TopK here, or it will crash
@@ -110,13 +128,68 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
 
+#ifndef USE_ROCM
   for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
     const auto bin = convert_to_uint8(input[idx + row_start]);
     ::atomicAdd(&s_histogram[bin], 1);
   }
+#else
+  // Same work, but the loads for a trip are all issued before any of them is
+  // consumed. Stride stays BLOCK_SIZE so each load is still coalesced; row_start
+  // is an arbitrary runtime offset, so a wider vector load is not available.
+  for (int base = tx; base < length; base += kUnroll * BLOCK_SIZE) {
+    float v[kUnroll];
+    bool ok[kUnroll];
+#pragma unroll
+    for (int k = 0; k < kUnroll; ++k) {
+      const int idx = base + k * BLOCK_SIZE;
+      ok[k] = idx < length;
+      v[k] = ok[k] ? input[idx + row_start] : 0.0f;
+    }
+#pragma unroll
+    for (int k = 0; k < kUnroll; ++k) {
+      if (ok[k]) ::atomicAdd(&s_histogram[convert_to_uint8(v[k])], 1);
+    }
+  }
+#endif
   __syncthreads();
 
   const auto run_cumsum = [&] {
+#ifdef USE_ROCM
+    // Inclusive suffix sum over s_histogram[0..RADIX), confined to wave 0 and
+    // done with shuffles, so the block pays 1 barrier instead of 8: the
+    // original runs 8 rounds in which only 256 of the 1024 threads work, yet
+    // all 16 wave64s stop at every one. Worth ~1.3 us per launch.
+    //
+    // s_histogram[RADIX] is not touched here; the `tx < RADIX + 1` initialisers
+    // zero it and it must stay 0.
+    static_assert(RADIX % kWaveSize == 0);
+    if (tx < kWaveSize) {
+      constexpr int kPerLane = RADIX / kWaveSize;
+      const int base_i = tx * kPerLane;
+      int v[kPerLane];
+#pragma unroll
+      for (int k = 0; k < kPerLane; ++k)
+        v[k] = s_histogram[base_i + k];
+      // suffix sum of this lane's own slice
+#pragma unroll
+      for (int k = kPerLane - 2; k >= 0; --k)
+        v[k] += v[k + 1];
+      // suffix scan of the per-lane totals across the wave
+      const int total = v[0];
+      int suf = total;
+#pragma unroll
+      for (int d = 1; d < kWaveSize; d <<= 1) {
+        const int y = __shfl_down(suf, d);
+        if (tx + d < kWaveSize) suf += y;
+      }
+      const int excl = suf - total;  // sum of every bin owned by a later lane
+#pragma unroll
+      for (int k = 0; k < kPerLane; ++k)
+        s_histogram[base_i + k] = v[k] + excl;
+    }
+    __syncthreads();
+#else
 #pragma unroll 8
     for (int i = 0; i < 8; ++i) {
       static_assert(1 << 8 == RADIX);
@@ -131,6 +204,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       }
       __syncthreads();
     }
+#endif
   };
 
   run_cumsum();
@@ -161,6 +235,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
     }
     __syncthreads();
 
+#ifndef USE_ROCM
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
       const auto raw_input = input[idx + row_start];
       const auto bin = static_cast<int>(convert_to_uint8(raw_input));
@@ -178,6 +253,37 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
         }
       }
     }
+#else
+    for (int base = tx; base < length; base += kUnroll * BLOCK_SIZE) {
+      float v[kUnroll];
+      bool ok[kUnroll];
+#pragma unroll
+      for (int k = 0; k < kUnroll; ++k) {
+        const int i = base + k * BLOCK_SIZE;
+        ok[k] = i < length;
+        v[k] = ok[k] ? input[i + row_start] : 0.0f;
+      }
+#pragma unroll
+      for (int k = 0; k < kUnroll; ++k) {
+        if (!ok[k]) continue;
+        const int idx = base + k * BLOCK_SIZE;
+        const auto raw_input = v[k];
+        const auto bin = static_cast<int>(convert_to_uint8(raw_input));
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          const auto pos = ::atomicAdd(&s_num_input[0], 1);
+          /// NOTE: (dark) fuse the histogram computation here
+          if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+            s_input_idx[0][pos] = idx;
+            const auto sub_bin = (convert_to_uint32(raw_input) >> 24) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+    }
+#endif
     __syncthreads();
   }
 
