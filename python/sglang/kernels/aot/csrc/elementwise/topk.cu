@@ -87,18 +87,90 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+// Lanes per wave/warp, used by the deterministic tie-break scan below. On ROCm
+// it can be injected per-arch from setup_rocm.py the same way the dynamic LDS
+// budget is; it is not read from a target macro because this is a host+device
+// translation unit and ROCm 7.0 deprecates both __AMDGCN_WAVEFRONT_SIZE__ and
+// the constexpr `warpSize` variable.
+#ifdef USE_ROCM
+#ifdef SGL_TOPK_WAVE_SIZE
+constexpr int kWaveSize = SGL_TOPK_WAVE_SIZE;
+#else
+constexpr int kWaveSize = 64;  // gfx9/CDNA, the default build target
+#endif
+#else
+constexpr int kWaveSize = 32;
+#endif
+
+// Deterministic tie-breaking costs an extra ballot scan over the row, so it is
+// opt-in. When it is off, ties among equal keys are resolved by whichever thread
+// claims the slot first, which is what this kernel has always done.
+#ifndef SGL_TOPK_DETERMINISTIC_TIES
+#define SGL_TOPK_DETERMINISTIC_TIES 0
+#endif
+constexpr bool kDeterministicTies = SGL_TOPK_DETERMINISTIC_TIES != 0;
+
+// Block-wide exclusive rank of a predicate, plus the block-wide total.
+// Two-level ballot scan: no cub/rocPRIM dependency, and the only extra LDS is
+// one counter per wave. Every thread of the block must reach this.
+__device__ __forceinline__ void block_scan_flag(bool pred, int* __restrict__ s_wave, int& rank, int& total) {
+  constexpr int kNumWaves = kThreadsPerBlock / kWaveSize;
+  const int lane = static_cast<int>(threadIdx.x) & (kWaveSize - 1);
+  const int wave = static_cast<int>(threadIdx.x) / kWaveSize;
+#ifdef USE_ROCM
+  const uint64_t ballot = __ballot(pred);
+  const int lane_rank = __popcll(ballot & ((1ull << lane) - 1ull));
+  const int wave_count = __popcll(ballot);
+#else
+  const uint32_t ballot = __ballot_sync(0xffffffffu, pred);
+  const int lane_rank = __popc(ballot & ((1u << lane) - 1u));
+  const int wave_count = __popc(ballot);
+#endif
+  if (lane == 0) s_wave[wave] = wave_count;
+  __syncthreads();
+  int prefix = 0;
+  int sum = 0;
+#pragma unroll
+  for (int w = 0; w < kNumWaves; ++w) {
+    const int c = s_wave[w];
+    if (w < wave) prefix += c;
+    sum += c;
+  }
+  rank = prefix + lane_rank;
+  total = sum;
+  __syncthreads();
+}
+
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
-  // An optimized topk kernel copied from tilelang kernel
+  // An optimized topk kernel copied from tilelang kernel, restructured to follow
+  // the guess-verify-refine shape used by flashinfer's FilteredTopK:
+  //   guess  - one 8-bit coarse histogram over the whole row picks the bin that
+  //            straddles the top-k threshold;
+  //   verify - a suffix scan tells us exactly how many winners are above that bin
+  //            and how many still have to come out of it;
+  //   refine - the straddling bin is descended one byte at a time.
+  // The parts this file was missing are the capacity check on the candidate
+  // buffer, a correctness-first fallback for when it does overflow, and a
+  // deterministic tie-break.
   // We assume length > TopK here, or it will crash
   int topk = TopK;
   constexpr auto BLOCK_SIZE = 1024;
   constexpr auto RADIX = 256;
   constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
+  // fp32 ordered keys are 4 bytes and the coarse key consumes none of them (it
+  // comes from a lossy fp16 conversion), so the descent takes 4 rounds.
+  constexpr int NUM_ROUNDS = 4;
+  constexpr int FIRST_SHIFT = 24;
 
   alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
   alignas(128) __shared__ int s_num_input[2];
+  alignas(128) __shared__ int s_last_remain;
+  alignas(128) __shared__ int s_refine_overflow;
+  alignas(128) __shared__ int s_eq_counter;
+  alignas(128) __shared__ int s_refine_thresholds[NUM_ROUNDS];
+  alignas(128) __shared__ int s_wave_scan[kThreadsPerBlock / kWaveSize];
 
   auto& s_histogram = s_histogram_buf[0];
   // allocate for two rounds
@@ -108,6 +180,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
 
   // stage 1: 8bit coarse histogram
   if (tx < RADIX + 1) s_histogram[tx] = 0;
+  if (tx == 0) s_refine_overflow = 0;
   __syncthreads();
 
   for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -133,6 +206,22 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
     }
   };
 
+  // Append a winner. Callers only ever emit at most `topk` of these, so the
+  // slot is in range by construction; the check is here because a silent
+  // out-of-bounds write is exactly the failure this rewrite is meant to remove.
+  const auto emit_winner = [&](int idx) {
+    const auto pos = ::atomicAdd(&s_counter, 1);
+    if (C10_LIKELY(pos < TopK)) index[pos] = idx;
+  };
+
+  // Claim one of the remaining equal-key slots, filling backwards from the end
+  // of the output so that it can never collide with the winners growing forward
+  // from s_counter. Exactly `s_last_remain` of them are handed out.
+  const auto claim_tie_slot = [&](int idx) {
+    const auto pos = ::atomicAdd(&s_last_remain, -1);
+    if (pos > 0) index[TopK - pos] = idx;
+  };
+
   run_cumsum();
   if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
     s_threshold_bin_id = tx;
@@ -143,78 +232,106 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
 
   const auto threshold_bin = s_threshold_bin_id;
   topk -= s_histogram[threshold_bin + 1];
+  const int topk_after_coarse = topk;
+
+  // Deterministic tie-break: fill the last `eq_needed` slots with the lowest
+  // indices whose ordered key equals the pivot. The row is walked in tiles of
+  // BLOCK_SIZE with thread tx owning idx = base + tx, so the emission order is
+  // index order regardless of how the hardware schedules the waves.
+  const auto collect_det_eq_pivot = [&](uint32_t pivot, int eq_needed) {
+    if (eq_needed <= 0) return;
+    if (tx == 0) s_eq_counter = 0;
+    __syncthreads();
+    for (int base = 0; base < length; base += BLOCK_SIZE) {
+      const int idx = base + tx;
+      const bool pred = (idx < length) && (convert_to_uint32(input[idx + row_start]) == pivot);
+      int rank = 0;
+      int total = 0;
+      block_scan_flag(pred, s_wave_scan, rank, total);
+      const int start = s_eq_counter;
+      if (pred) {
+        const int pos = start + rank;
+        if (pos < eq_needed) index[TopK - eq_needed + pos] = idx;
+      }
+      __syncthreads();
+      if (tx == 0) s_eq_counter = start + total;
+      __syncthreads();
+      if (s_eq_counter >= eq_needed) break;
+    }
+  };
 
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
       const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
-      }
+      if (bin > threshold_bin) emit_winner(idx);
     }
     __syncthreads();
     return;
-  } else {
-    __syncthreads();
-    if (tx < RADIX + 1) {
-      s_histogram[tx] = 0;
-    }
-    __syncthreads();
-
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto raw_input = input[idx + row_start];
-      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
-      } else if (bin == threshold_bin) {
-        const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        /// NOTE: (dark) fuse the histogram computation here
-        if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-          s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
-        }
-      }
-    }
-    __syncthreads();
   }
 
-  // stage 2: refine with 8bit radix passes
-#pragma unroll 4
-  for (int round = 0; round < 4; ++round) {
-    __shared__ int s_last_remain;
-    const auto r_idx = round % 2;
+  __syncthreads();
+  if (tx < RADIX + 1) {
+    s_histogram[tx] = 0;
+  }
+  __syncthreads();
 
-    // clip here to prevent overflow
-    const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
-
-    run_cumsum();
-    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-      s_threshold_bin_id = tx;
-      s_num_input[r_idx ^ 1] = 0;
-      s_last_remain = topk - s_histogram[tx + 1];
+  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    const auto raw_input = input[idx + row_start];
+    const auto bin = static_cast<int>(convert_to_uint8(raw_input));
+    if (bin > threshold_bin) {
+      emit_winner(idx);
+    } else if (bin == threshold_bin) {
+      const auto pos = ::atomicAdd(&s_num_input[0], 1);
+      /// NOTE: (dark) fuse the histogram computation here
+      if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+        s_input_idx[0][pos] = idx;
+        const auto sub_bin = (convert_to_uint32(raw_input) >> FIRST_SHIFT) & 0xFF;
+        ::atomicAdd(&s_histogram[sub_bin], 1);
+      } else {
+        // The candidate buffer is full. Everything past this point in the fast
+        // path would be selecting from an incomplete set, so flag it and let the
+        // fallback below rebuild the answer from the row itself.
+        ::atomicOr(&s_refine_overflow, 1);
+      }
     }
-    __syncthreads();
+  }
+  __syncthreads();
 
-    const auto threshold_bin = s_threshold_bin_id;
-    topk -= s_histogram[threshold_bin + 1];
+  // stage 2: refine with 8bit radix passes
+  int det_stop_round = NUM_ROUNDS - 1;
+  if (!s_refine_overflow) {
+#pragma unroll 4
+    for (int round = 0; round < NUM_ROUNDS; ++round) {
+      const auto r_idx = round % 2;
 
-    if (topk == 0) {
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
-        }
+      // clip here to prevent overflow
+      const auto _raw_num_input = s_num_input[r_idx];
+      const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
+
+      run_cumsum();
+      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+        s_threshold_bin_id = tx;
+        s_num_input[r_idx ^ 1] = 0;
+        s_last_remain = topk - s_histogram[tx + 1];
       }
       __syncthreads();
-      break;
-    } else {
+
+      const auto threshold = s_threshold_bin_id;
+      const auto offset = FIRST_SHIFT - round * 8;
+      if (kDeterministicTies && tx == 0) s_refine_thresholds[round] = threshold;
+      topk -= s_histogram[threshold + 1];
+
+      if (topk == 0) {
+        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[r_idx][i];
+          const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
+          if (static_cast<int>(bin) > threshold) emit_winner(idx);
+        }
+        __syncthreads();
+        det_stop_round = round;
+        break;
+      }
+
       __syncthreads();
       if (tx < RADIX + 1) {
         s_histogram[tx] = 0;
@@ -223,32 +340,129 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
         const auto idx = s_input_idx[r_idx][i];
         const auto raw_input = input[idx + row_start];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
-        } else if (bin == threshold_bin) {
-          if (round == 3) {
-            const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-              index[TopK - pos] = idx;
-            }
+        const auto bin = static_cast<int>((convert_to_uint32(raw_input) >> offset) & 0xFF);
+        if (bin > threshold) {
+          emit_winner(idx);
+        } else if (bin == threshold) {
+          if (round == NUM_ROUNDS - 1) {
+            // Last round: the key is fully resolved, so everything still equal to
+            // the threshold is a genuine tie.
+            if (!kDeterministicTies) claim_tie_slot(idx);
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
             if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
               /// NOTE: (dark) fuse the histogram computation here
               s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto bin = convert_to_uint32(raw_input);
-              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
+              const auto sub_bin = (convert_to_uint32(raw_input) >> (offset - 8)) & 0xFF;
               ::atomicAdd(&s_histogram[sub_bin], 1);
+            } else {
+              ::atomicOr(&s_refine_overflow, 1);
             }
           }
         }
       }
       __syncthreads();
+      if (s_refine_overflow) break;
     }
   }
+
+  if (!s_refine_overflow) {
+    if (kDeterministicTies) {
+      uint32_t pivot = 0;
+#pragma unroll
+      for (int round = 0; round < NUM_ROUNDS; ++round) {
+        const uint32_t byte = (round <= det_stop_round) ? static_cast<uint32_t>(s_refine_thresholds[round]) : 0xFFu;
+        pivot |= byte << (FIRST_SHIFT - round * 8);
+      }
+      collect_det_eq_pivot(pivot, topk);
+    }
+    return;
+  }
+
+  // Overflow fallback. The candidate buffer could not hold the whole threshold
+  // bin, so redo the descent straight off the row: each round histograms only
+  // the elements of the threshold bin whose key already matches every byte
+  // picked so far. This costs one full pass per round instead of one pass over
+  // the candidates, but it does not depend on the buffer capacity at all.
+  uint32_t topk_remain = static_cast<uint32_t>(topk_after_coarse);
+  uint8_t threshold_bytes[NUM_ROUNDS];
+#pragma unroll
+  for (int i = 0; i < NUM_ROUNDS; ++i) threshold_bytes[i] = 0xFF;
+  int stop_round = NUM_ROUNDS - 1;
+
+#pragma unroll 1
+  for (int round = 0; round < NUM_ROUNDS; ++round) {
+    const int offset = FIRST_SHIFT - round * 8;
+
+    if (tx < RADIX + 1) s_histogram[tx] = 0;
+    __syncthreads();
+
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+      const auto raw_input = input[idx + row_start];
+      if (static_cast<int>(convert_to_uint8(raw_input)) != threshold_bin) continue;
+      const auto ordered = convert_to_uint32(raw_input);
+      bool prefix_match = true;
+#pragma unroll
+      for (int prev = 0; prev < NUM_ROUNDS; ++prev) {
+        if (prev >= round) continue;
+        const int prev_offset = FIRST_SHIFT - prev * 8;
+        if (static_cast<uint8_t>((ordered >> prev_offset) & 0xFF) != threshold_bytes[prev]) prefix_match = false;
+      }
+      if (prefix_match) ::atomicAdd(&s_histogram[(ordered >> offset) & 0xFF], 1);
+    }
+    __syncthreads();
+
+    run_cumsum();
+    if (tx < RADIX && s_histogram[tx] > static_cast<int>(topk_remain) &&
+        s_histogram[tx + 1] <= static_cast<int>(topk_remain)) {
+      s_threshold_bin_id = tx;
+    }
+    __syncthreads();
+
+    const int threshold = s_threshold_bin_id;
+    threshold_bytes[round] = static_cast<uint8_t>(threshold);
+    topk_remain -= static_cast<uint32_t>(s_histogram[threshold + 1]);
+    __syncthreads();
+    if (topk_remain == 0) {
+      stop_round = round;
+      break;
+    }
+  }
+
+  uint32_t pivot = 0;
+#pragma unroll
+  for (int round = 0; round < NUM_ROUNDS; ++round) {
+    uint32_t byte = static_cast<uint32_t>(threshold_bytes[round]);
+    if (topk_remain == 0 && round > stop_round) byte = 0xFFu;
+    pivot |= byte << (FIRST_SHIFT - round * 8);
+  }
+  const int eq_needed = static_cast<int>(topk_remain);
+
+  // Earlier rounds already wrote part of s_indices, so reset and rebuild from
+  // full scans rather than mixing stale partial state into the result.
+  if (tx == 0) {
+    s_counter = 0;
+    s_last_remain = eq_needed;
+  }
+  __syncthreads();
+
+  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    const auto raw_input = input[idx + row_start];
+    const auto coarse = static_cast<int>(convert_to_uint8(raw_input));
+    if (coarse > threshold_bin) {
+      emit_winner(idx);
+    } else if (coarse == threshold_bin) {
+      const auto ordered = convert_to_uint32(raw_input);
+      if (ordered > pivot) {
+        emit_winner(idx);
+      } else if (ordered == pivot && !kDeterministicTies) {
+        claim_tie_slot(idx);
+      }
+    }
+  }
+  __syncthreads();
+
+  if (kDeterministicTies) collect_det_eq_pivot(pivot, eq_needed);
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
