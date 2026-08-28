@@ -149,44 +149,162 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   //   verify - a suffix scan tells us exactly how many winners are above that bin
   //            and how many still have to come out of it;
   //   refine - the straddling bin is descended one byte at a time.
-  // The parts this file was missing are the capacity check on the candidate
-  // buffer, a correctness-first fallback for when it does overflow, and a
-  // deterministic tie-break.
+  //
+  // The survivor set of a refine round normally lives in an LDS buffer of fixed
+  // capacity. A clustered row can put far more than that into the straddling
+  // bin, and the surplus used to be dropped without any indication, so the
+  // returned top-k was silently incomplete. The descent now keeps running
+  // straight off the row when the survivors do not fit, and re-enters the buffer
+  // as soon as they do: such a row costs extra passes rather than a wrong answer.
+  //
   // We assume length > TopK here, or it will crash
   int topk = TopK;
   constexpr auto BLOCK_SIZE = 1024;
   constexpr auto RADIX = 256;
-  constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
+
+  // A single shared histogram serialises hard: a wave puts 64 lanes on ~64 of
+  // the 256 bins, and 256 ints cover the 32 LDS banks eight times over, so the
+  // hardware replays each atomic once per colliding bank. Keeping several
+  // copies of the histogram and picking one per lane fixes that, but only if
+  // the copies sit in different banks - at a stride of RADIX every copy aliases
+  // the same banks and the contention is exactly unchanged. Hence RADIX + 1.
+  constexpr int kHistStride = RADIX + 1;
+#ifndef SGL_TOPK_HIST_COPIES
+#define SGL_TOPK_HIST_COPIES (kSmem >= 96 * 1024 ? 16 : (kSmem >= 24 * 1024 ? 8 : 4))
+#endif
+#ifndef SGL_TOPK_LOOK_COPIES
+#define SGL_TOPK_LOOK_COPIES (kSmem >= 96 * 1024 ? 8 : (kSmem >= 24 * 1024 ? 4 : 2))
+#endif
+  constexpr int kHistCopies = SGL_TOPK_HIST_COPIES;
+  constexpr int kLookCopies = SGL_TOPK_LOOK_COPIES;
+  constexpr int kHistInts = kHistCopies * kHistStride;
+  constexpr int kLookInts = kLookCopies * kHistStride;
+  // The copies are carved out of the same dynamic allocation as the candidate
+  // buffer, so the block's LDS footprint is unchanged and every architecture
+  // keeps the occupancy it had before.
+  constexpr int kBufTotal = static_cast<int>((kSmem - (kHistInts + kLookInts) * sizeof(int)) / sizeof(int));
+  // The two buffers ping-pong, but they do not carry comparable loads: the
+  // first holds the entire straddling bin while every later round holds what
+  // survived a byte split of it. Splitting the space evenly therefore wastes
+  // half of it on a set that has already collapsed, and pushes bins that would
+  // otherwise have fit into the much more expensive off-row descent. A bin that
+  // genuinely fails to shrink still lands there, and is still answered
+  // correctly.
+  constexpr int kBufCap0 = kBufTotal * 3 / 4;
+  constexpr int kBufCap1 = kBufTotal - kBufCap0;
   // fp32 ordered keys are 4 bytes and the coarse key consumes none of them (it
   // comes from a lossy fp16 conversion), so the descent takes 4 rounds.
   constexpr int NUM_ROUNDS = 4;
   constexpr int FIRST_SHIFT = 24;
 
   alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
+  // Histogram of the second refine byte, gathered in the same pass as the first.
+  // The coarse fp16 key is sign+exp+2 mantissa bits while the top fp32 byte is
+  // sign+exp minus its low bit, so one coarse bin is eight times narrower than
+  // one fp32 byte: round 0 nearly always has nothing left to split. When that
+  // holds, this histogram already describes round 1 and its pass is skipped.
+  alignas(128) __shared__ int s_hist_lookahead[RADIX + 1];
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
   alignas(128) __shared__ int s_num_input[2];
   alignas(128) __shared__ int s_last_remain;
-  alignas(128) __shared__ int s_refine_overflow;
+  alignas(128) __shared__ int s_spill;
   alignas(128) __shared__ int s_eq_counter;
-  alignas(128) __shared__ int s_refine_thresholds[NUM_ROUNDS];
   alignas(128) __shared__ int s_wave_scan[kThreadsPerBlock / kWaveSize];
 
   auto& s_histogram = s_histogram_buf[0];
+  extern __shared__ int s_dynamic[];
+  int* const s_hist_copies = s_dynamic;
+  int* const s_look_copies = s_dynamic + kHistInts;
   // allocate for two rounds
-  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
+  int* const s_buf0 = s_dynamic + kHistInts + kLookInts;
+  int* const s_buf1 = s_buf0 + kBufCap0;
+  const auto buf_of = [&](int i) { return i == 0 ? s_buf0 : s_buf1; };
+  const auto cap_of = [](int i) { return i == 0 ? kBufCap0 : kBufCap1; };
 
   const int tx = threadIdx.x;
+  const float* const row = input + row_start;
+
+  // Zeroing and folding the copies costs the same whether the pass counts four
+  // thousand elements or a hundred thousand, so a short pass is charged for
+  // contention it never had. Each pass therefore takes only as many copies as
+  // its own element count justifies, which keeps short rows on the cheap path.
+#ifndef SGL_TOPK_COPY_WORK
+#define SGL_TOPK_COPY_WORK 2048
+#endif
+  constexpr int kCopyWork = SGL_TOPK_COPY_WORK;
+  const auto copies_for = [](int work, int cap) {
+    int c = 1;
+    while (c < cap && work >= c * kCopyWork) c <<= 1;
+    return c;
+  };
+
+  int hist_live = 1;
+  int look_live = 1;
+  int* hist_lane = s_hist_copies;
+  int* look_lane = s_look_copies;
+  const auto hist_begin = [&](int work) {
+    hist_live = copies_for(work, kHistCopies);
+    hist_lane = s_hist_copies + (tx & (hist_live - 1)) * kHistStride;
+    for (int i = tx; i < hist_live * kHistStride; i += BLOCK_SIZE) s_hist_copies[i] = 0;
+  };
+  const auto look_begin = [&](int work) {
+    look_live = copies_for(work, kLookCopies);
+    look_lane = s_look_copies + (tx & (look_live - 1)) * kHistStride;
+    for (int i = tx; i < look_live * kHistStride; i += BLOCK_SIZE) s_look_copies[i] = 0;
+  };
+  const auto hist_bump = [&](int bin) { ::atomicAdd(&hist_lane[bin], 1); };
+  const auto look_bump = [&](int bin) { ::atomicAdd(&look_lane[bin], 1); };
+  // Fold the copies back into the histogram the cumsum works on. Slot RADIX is
+  // the suffix-scan sentinel and is always read one past the last bin.
+  const auto hist_fold = [&] {
+    if (tx < RADIX) {
+      int sum = 0;
+      for (int r = 0; r < hist_live; ++r) sum += s_hist_copies[r * kHistStride + tx];
+      s_histogram[tx] = sum;
+    } else if (tx == RADIX) {
+      s_histogram[RADIX] = 0;
+    }
+  };
+  const auto look_fold = [&] {
+    if (tx < RADIX) {
+      int sum = 0;
+      for (int r = 0; r < look_live; ++r) sum += s_look_copies[r * kHistStride + tx];
+      s_hist_lookahead[tx] = sum;
+    } else if (tx == RADIX) {
+      s_hist_lookahead[RADIX] = 0;
+    }
+  };
+
+  // Visit every element of the row, four at a time. A single float per thread
+  // per step leaves the memory pipeline mostly idle: one block owns a whole row,
+  // so the only way to keep enough loads in flight is to widen them. The row
+  // base is not guaranteed to be 16B aligned, so the unaligned head and the
+  // ragged tail are walked one element at a time.
+  const auto for_each_element = [&](auto&& fn) {
+    const int head = static_cast<int>((16u - (reinterpret_cast<uintptr_t>(row) & 15u)) & 15u) / 4;
+    const int lead = head < length ? head : length;
+    for (int i = tx; i < lead; i += BLOCK_SIZE) fn(i, row[i]);
+    const int n4 = (length - lead) / 4;
+    const float4* const row4 = reinterpret_cast<const float4*>(row + lead);
+    for (int i = tx; i < n4; i += BLOCK_SIZE) {
+      const float4 v = row4[i];
+      const int base = lead + i * 4;
+      fn(base + 0, v.x);
+      fn(base + 1, v.y);
+      fn(base + 2, v.z);
+      fn(base + 3, v.w);
+    }
+    for (int i = lead + n4 * 4 + tx; i < length; i += BLOCK_SIZE) fn(i, row[i]);
+  };
 
   // stage 1: 8bit coarse histogram
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
-  if (tx == 0) s_refine_overflow = 0;
+  hist_begin(length);
   __syncthreads();
 
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
-    ::atomicAdd(&s_histogram[bin], 1);
-  }
+  for_each_element([&](int, float value) { hist_bump(convert_to_uint8(value)); });
+  __syncthreads();
+  hist_fold();
   __syncthreads();
 
   const auto run_cumsum = [&] {
@@ -206,8 +324,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
     }
   };
 
-  // Append a winner. Callers only ever emit at most `topk` of these, so the
-  // slot is in range by construction; the check is here because a silent
+  // Append a winner. Callers only ever emit at most `topk` of these, so the slot
+  // is in range by construction; the check is here because a silent
   // out-of-bounds write is exactly the failure this rewrite is meant to remove.
   const auto emit_winner = [&](int idx) {
     const auto pos = ::atomicAdd(&s_counter, 1);
@@ -222,22 +340,12 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
     if (pos > 0) index[TopK - pos] = idx;
   };
 
-  run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-    s_threshold_bin_id = tx;
-    s_num_input[0] = 0;
-    s_counter = 0;
-  }
-  __syncthreads();
-
-  const auto threshold_bin = s_threshold_bin_id;
-  topk -= s_histogram[threshold_bin + 1];
-  const int topk_after_coarse = topk;
-
   // Deterministic tie-break: fill the last `eq_needed` slots with the lowest
   // indices whose ordered key equals the pivot. The row is walked in tiles of
   // BLOCK_SIZE with thread tx owning idx = base + tx, so the emission order is
-  // index order regardless of how the hardware schedules the waves.
+  // index order regardless of how the hardware schedules the waves. This one
+  // stays scalar: the ballot scan ranks one flag per thread, and widening the
+  // load would put four indices behind each flag.
   const auto collect_det_eq_pivot = [&](uint32_t pivot, int eq_needed) {
     if (eq_needed <= 0) return;
     if (tx == 0) s_eq_counter = 0;
@@ -260,209 +368,174 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
     }
   };
 
+  run_cumsum();
+  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+    s_threshold_bin_id = tx;
+    s_num_input[0] = 0;
+    s_counter = 0;
+    s_spill = 0;
+  }
+  __syncthreads();
+
+  const int threshold_bin = s_threshold_bin_id;
+  const int bin_count = s_histogram[threshold_bin] - s_histogram[threshold_bin + 1];
+  topk -= s_histogram[threshold_bin + 1];
+
   if (topk == 0) {
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
-      if (bin > threshold_bin) emit_winner(idx);
-    }
+    for_each_element([&](int idx, float value) {
+      if (static_cast<int>(convert_to_uint8(value)) > threshold_bin) emit_winner(idx);
+    });
     __syncthreads();
     return;
   }
 
   __syncthreads();
-  if (tx < RADIX + 1) {
-    s_histogram[tx] = 0;
-  }
+  hist_begin(bin_count);
+  look_begin(bin_count);
   __syncthreads();
 
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto raw_input = input[idx + row_start];
-    const auto bin = static_cast<int>(convert_to_uint8(raw_input));
+  // stage 2: collect the threshold bin. Both fused histograms count every element
+  // of the bin, including the ones the buffer had no room for, so an overflowing
+  // bin still leaves an exact picture of it behind.
+  for_each_element([&](int idx, float value) {
+    const auto bin = static_cast<int>(convert_to_uint8(value));
     if (bin > threshold_bin) {
       emit_winner(idx);
     } else if (bin == threshold_bin) {
+      const auto key = convert_to_uint32(value);
       const auto pos = ::atomicAdd(&s_num_input[0], 1);
-      /// NOTE: (dark) fuse the histogram computation here
-      if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-        s_input_idx[0][pos] = idx;
-        const auto sub_bin = (convert_to_uint32(raw_input) >> FIRST_SHIFT) & 0xFF;
-        ::atomicAdd(&s_histogram[sub_bin], 1);
+      if (C10_LIKELY(pos < kBufCap0)) {
+        s_buf0[pos] = idx;
       } else {
-        // The candidate buffer is full. Everything past this point in the fast
-        // path would be selecting from an incomplete set, so flag it and let the
-        // fallback below rebuild the answer from the row itself.
-        ::atomicOr(&s_refine_overflow, 1);
+        ::atomicOr(&s_spill, 1);
       }
+      /// NOTE: (dark) fuse the histogram computation here
+      hist_bump((key >> FIRST_SHIFT) & 0xFF);
+      look_bump((key >> (FIRST_SHIFT - 8)) & 0xFF);
     }
-  }
+  });
+  __syncthreads();
+  hist_fold();
+  look_fold();
   __syncthreads();
 
-  // stage 2: refine with 8bit radix passes
-  int det_stop_round = NUM_ROUNDS - 1;
-  if (!s_refine_overflow) {
-#pragma unroll 4
-    for (int round = 0; round < NUM_ROUNDS; ++round) {
-      const auto r_idx = round % 2;
+  // stage 3: refine with 8bit radix passes
+  int cur = 0;
+  int num_input = s_num_input[0] < kBufCap0 ? s_num_input[0] : kBufCap0;
+  bool from_row = s_spill != 0;
+  uint32_t prefix = 0;
+  uint32_t prefix_mask = 0;
+  int survivors = bin_count;
 
-      // clip here to prevent overflow
-      const auto _raw_num_input = s_num_input[r_idx];
-      const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
-
-      run_cumsum();
-      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-        s_threshold_bin_id = tx;
-        s_num_input[r_idx ^ 1] = 0;
-        s_last_remain = topk - s_histogram[tx + 1];
-      }
-      __syncthreads();
-
-      const auto threshold = s_threshold_bin_id;
-      const auto offset = FIRST_SHIFT - round * 8;
-      if (kDeterministicTies && tx == 0) s_refine_thresholds[round] = threshold;
-      topk -= s_histogram[threshold + 1];
-
-      if (topk == 0) {
-        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-          const auto idx = s_input_idx[r_idx][i];
-          const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
-          if (static_cast<int>(bin) > threshold) emit_winner(idx);
-        }
-        __syncthreads();
-        det_stop_round = round;
-        break;
-      }
-
-      __syncthreads();
-      if (tx < RADIX + 1) {
-        s_histogram[tx] = 0;
-      }
-      __syncthreads();
+  // Walk whatever holds the current survivor set: the LDS buffer, or the row
+  // itself for a bin that never fit in it.
+  const auto for_each_survivor = [&](auto&& fn) {
+    if (from_row) {
+      for_each_element([&](int idx, float value) {
+        if (static_cast<int>(convert_to_uint8(value)) != threshold_bin) return;
+        const auto key = convert_to_uint32(value);
+        if ((key & prefix_mask) != prefix) return;
+        fn(idx, key);
+      });
+    } else {
+      const int* const buf = buf_of(cur);
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto raw_input = input[idx + row_start];
-        const auto bin = static_cast<int>((convert_to_uint32(raw_input) >> offset) & 0xFF);
-        if (bin > threshold) {
-          emit_winner(idx);
-        } else if (bin == threshold) {
-          if (round == NUM_ROUNDS - 1) {
-            // Last round: the key is fully resolved, so everything still equal to
-            // the threshold is a genuine tie.
-            if (!kDeterministicTies) claim_tie_slot(idx);
-          } else {
-            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
-            if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-              /// NOTE: (dark) fuse the histogram computation here
-              s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto sub_bin = (convert_to_uint32(raw_input) >> (offset - 8)) & 0xFF;
-              ::atomicAdd(&s_histogram[sub_bin], 1);
-            } else {
-              ::atomicOr(&s_refine_overflow, 1);
-            }
-          }
-        }
+        const auto idx = buf[i];
+        fn(idx, convert_to_uint32(row[idx]));
       }
-      __syncthreads();
-      if (s_refine_overflow) break;
     }
-  }
+  };
 
-  if (!s_refine_overflow) {
-    if (kDeterministicTies) {
-      uint32_t pivot = 0;
 #pragma unroll
-      for (int round = 0; round < NUM_ROUNDS; ++round) {
-        const uint32_t byte = (round <= det_stop_round) ? static_cast<uint32_t>(s_refine_thresholds[round]) : 0xFFu;
-        pivot |= byte << (FIRST_SHIFT - round * 8);
-      }
-      collect_det_eq_pivot(pivot, topk);
-    }
-    return;
-  }
-
-  // Overflow fallback. The candidate buffer could not hold the whole threshold
-  // bin, so redo the descent straight off the row: each round histograms only
-  // the elements of the threshold bin whose key already matches every byte
-  // picked so far. This costs one full pass per round instead of one pass over
-  // the candidates, but it does not depend on the buffer capacity at all.
-  uint32_t topk_remain = static_cast<uint32_t>(topk_after_coarse);
-  uint8_t threshold_bytes[NUM_ROUNDS];
-#pragma unroll
-  for (int i = 0; i < NUM_ROUNDS; ++i) threshold_bytes[i] = 0xFF;
-  int stop_round = NUM_ROUNDS - 1;
-
-#pragma unroll 1
   for (int round = 0; round < NUM_ROUNDS; ++round) {
     const int offset = FIRST_SHIFT - round * 8;
 
-    if (tx < RADIX + 1) s_histogram[tx] = 0;
-    __syncthreads();
-
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto raw_input = input[idx + row_start];
-      if (static_cast<int>(convert_to_uint8(raw_input)) != threshold_bin) continue;
-      const auto ordered = convert_to_uint32(raw_input);
-      bool prefix_match = true;
-#pragma unroll
-      for (int prev = 0; prev < NUM_ROUNDS; ++prev) {
-        if (prev >= round) continue;
-        const int prev_offset = FIRST_SHIFT - prev * 8;
-        if (static_cast<uint8_t>((ordered >> prev_offset) & 0xFF) != threshold_bytes[prev]) prefix_match = false;
-      }
-      if (prefix_match) ::atomicAdd(&s_histogram[(ordered >> offset) & 0xFF], 1);
-    }
-    __syncthreads();
-
     run_cumsum();
-    if (tx < RADIX && s_histogram[tx] > static_cast<int>(topk_remain) &&
-        s_histogram[tx + 1] <= static_cast<int>(topk_remain)) {
+    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
       s_threshold_bin_id = tx;
+      s_last_remain = topk - s_histogram[tx + 1];
+      s_num_input[cur ^ 1] = 0;
+      s_spill = 0;
     }
     __syncthreads();
 
     const int threshold = s_threshold_bin_id;
-    threshold_bytes[round] = static_cast<uint8_t>(threshold);
-    topk_remain -= static_cast<uint32_t>(s_histogram[threshold + 1]);
+    const int next_survivors = s_histogram[threshold] - s_histogram[threshold + 1];
+    topk -= s_histogram[threshold + 1];
+    // Every thread has to finish reading the histogram before anyone below
+    // overwrites it, either with zeros or with the lookahead.
     __syncthreads();
-    if (topk_remain == 0) {
-      stop_round = round;
-      break;
+
+    if (topk == 0) {
+      for_each_survivor([&](int idx, uint32_t key) {
+        if (static_cast<int>((key >> offset) & 0xFF) > threshold) emit_winner(idx);
+      });
+      __syncthreads();
+      return;
     }
-  }
 
-  uint32_t pivot = 0;
-#pragma unroll
-  for (int round = 0; round < NUM_ROUNDS; ++round) {
-    uint32_t byte = static_cast<uint32_t>(threshold_bytes[round]);
-    if (topk_remain == 0 && round > stop_round) byte = 0xFFu;
-    pivot |= byte << (FIRST_SHIFT - round * 8);
-  }
-  const int eq_needed = static_cast<int>(topk_remain);
+    if (round == NUM_ROUNDS - 1) {
+      // Last round: the key is fully resolved, so anything above the threshold
+      // byte is an outright winner and everything still on it is a genuine tie.
+      const uint32_t pivot = prefix | (static_cast<uint32_t>(threshold) << offset);
+      for_each_survivor([&](int idx, uint32_t key) {
+        const auto bin = static_cast<int>((key >> offset) & 0xFF);
+        if (bin > threshold) {
+          emit_winner(idx);
+        } else if (bin == threshold && !kDeterministicTies) {
+          claim_tie_slot(idx);
+        }
+      });
+      __syncthreads();
+      if (kDeterministicTies) collect_det_eq_pivot(pivot, topk);
+      return;
+    }
 
-  // Earlier rounds already wrote part of s_indices, so reset and rebuild from
-  // full scans rather than mixing stale partial state into the result.
-  if (tx == 0) {
-    s_counter = 0;
-    s_last_remain = eq_needed;
-  }
-  __syncthreads();
+    const int next_offset = offset - 8;
 
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto raw_input = input[idx + row_start];
-    const auto coarse = static_cast<int>(convert_to_uint8(raw_input));
-    if (coarse > threshold_bin) {
-      emit_winner(idx);
-    } else if (coarse == threshold_bin) {
-      const auto ordered = convert_to_uint32(raw_input);
-      if (ordered > pivot) {
+    // Nothing was split off, so the survivor set is unchanged and the lookahead
+    // histogram already describes the next byte over exactly this set. Skip the
+    // partition pass entirely; this is the common case for round 0.
+    if (round == 0 && next_survivors == survivors) {
+      prefix |= static_cast<uint32_t>(threshold) << offset;
+      prefix_mask |= 0xFFu << offset;
+      if (tx < RADIX + 1) s_histogram[tx] = s_hist_lookahead[tx];
+      __syncthreads();
+      continue;
+    }
+
+    hist_begin(survivors);
+    __syncthreads();
+
+    for_each_survivor([&](int idx, uint32_t key) {
+      const auto bin = static_cast<int>((key >> offset) & 0xFF);
+      if (bin > threshold) {
         emit_winner(idx);
-      } else if (ordered == pivot && !kDeterministicTies) {
-        claim_tie_slot(idx);
+      } else if (bin == threshold) {
+        const auto pos = ::atomicAdd(&s_num_input[cur ^ 1], 1);
+        if (C10_LIKELY(pos < cap_of(cur ^ 1))) {
+          buf_of(cur ^ 1)[pos] = idx;
+        } else {
+          ::atomicOr(&s_spill, 1);
+        }
+        /// NOTE: (dark) fuse the histogram computation here
+        hist_bump((key >> next_offset) & 0xFF);
       }
-    }
-  }
-  __syncthreads();
+    });
+    __syncthreads();
+    hist_fold();
+    __syncthreads();
 
-  if (kDeterministicTies) collect_det_eq_pivot(pivot, eq_needed);
+    // Only now that the round's winners are out may the filter tighten: until
+    // this point `prefix` has to describe the set entering the round, because
+    // the row scan uses it to rediscover exactly that set.
+    prefix |= static_cast<uint32_t>(threshold) << offset;
+    prefix_mask |= 0xFFu << offset;
+    cur ^= 1;
+    from_row = s_spill != 0;
+    num_input = s_num_input[cur] < cap_of(cur) ? s_num_input[cur] : cap_of(cur);
+    survivors = next_survivors;
+  }
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
