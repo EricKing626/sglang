@@ -290,6 +290,8 @@ def _sparse_mla_decode_split_kernel(
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    len_ptr=None,  # [N] valid prefix of each idx row; read when USE_LENGTH
+    USE_LENGTH: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -337,12 +339,20 @@ def _sparse_mla_decode_split_kernel(
         other=0.0,
     ).to(input_type)
 
-    tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
-    if pid_k * tiles_per_segment * BLOCK_K >= topk:
-        return
-    num_tiles = tl.cdiv(topk, BLOCK_K)
-    tile_start = pid_k * tiles_per_segment
-    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+    if USE_LENGTH:
+        # Spread only the row's valid tiles over every split; a split left with
+        # none still stores an empty partial, since the reduce reads all splits.
+        row_tiles = tl.cdiv(tl.load(len_ptr + t), BLOCK_K)
+        tiles_per_segment = tl.cdiv(row_tiles, KV_SPLITS)
+        tile_start = pid_k * tiles_per_segment
+        tile_end = tl.minimum(tile_start + tiles_per_segment, row_tiles)
+    else:
+        tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
+        if pid_k * tiles_per_segment * BLOCK_K >= topk:
+            return
+        num_tiles = tl.cdiv(topk, BLOCK_K)
+        tile_start = pid_k * tiles_per_segment
+        tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -484,14 +494,20 @@ def triton_sparse_mla_decode_splitk(
     sm_scale: float,
     d_v: int = 512,
     kv_splits: int | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lengths: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
     q_nope:  [bs, H, d_v] fp8/bf16
     q_rope:  [bs, H, d_tail] fp8/bf16
     kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
-    returns: [1, bs, H, d_v] bf16
+    lengths: optional [bs] int32; row b attends only indices[b, 0, :lengths[b]],
+        and the splits share that prefix instead of the full topk width
+    returns: [1, bs, H, d_v] bf16, plus a natural-log [bs, H] fp32 LSE when
+        ``return_lse``. A row with no valid index gets a zero output and a large
+        finite negative LSE, so it carries no weight in a cross-rank merge.
     """
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
     use_fp8_dot = is_fp8
@@ -545,7 +561,8 @@ def triton_sparse_mla_decode_splitk(
 
     qk_scale = float(sm_scale) * LOG2E
 
-    if kv_splits == 1:
+    # The fused one-split kernel takes neither an LSE output nor row lengths.
+    if kv_splits == 1 and not return_lse and lengths is None:
         out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
         with _no_async_copy():
             _sparse_mla_decode_fused_kernel[(bs, n_head_blocks)](
@@ -579,6 +596,8 @@ def triton_sparse_mla_decode_splitk(
         tiles_per_split * BLOCK_K
     )
     active_splits = min(active_splits, kv_splits)
+    if lengths is not None:
+        active_splits = kv_splits
 
     lse_partial, acc_partial = _get_splitk_bufs(
         bs, kv_splits, h_padded, d_v, q_nope.device
@@ -610,12 +629,19 @@ def triton_sparse_mla_decode_splitk(
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
+            len_ptr=lengths,
+            USE_LENGTH=lengths is not None,
             num_warps=4,
             num_stages=2,
         )
 
     D_CHUNK = 64
     grid_reduce = (bs, H, (d_v + D_CHUNK - 1) // D_CHUNK)
+    lse = (
+        torch.empty(bs, H, device=q_nope.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
     _sparse_mla_reduce_kernel[grid_reduce](
         lse_partial,
         acc_partial,
@@ -627,9 +653,13 @@ def triton_sparse_mla_decode_splitk(
         ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
+        lse_out_ptr=lse,
+        STORE_LSE=return_lse,
         num_warps=4,
     )
-    return out.unsqueeze(0)
+    if not return_lse:
+        return out.unsqueeze(0)
+    return out.unsqueeze(0), lse
 
 
 # ---------------------------------------------------------------------------
