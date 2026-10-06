@@ -1036,6 +1036,29 @@ class ModelRunner:
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
+        if get_parallel().dcp_enabled and _is_hip and envs.SGLANG_ROCM_DCP_PBM.get():
+            self._prepare_dcp_pbm_weights()
+
+    def _prepare_dcp_pbm_weights(self) -> None:
+        # Project-before-merge: each rank applies w_vc to the whole DCP group's
+        # heads before the LSE merge, so it needs the group's full w_vc.
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+            prepare_w_vc_dcp,
+        )
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        dcp_group = get_parallel().dcp_group
+        if dcp_group.world_size <= 1:
+            return
+        n_prepared = sum(
+            prepare_w_vc_dcp(m, dcp_group)
+            for m in self.model.modules()
+            if isinstance(m, DeepseekV2AttentionMLA)
+        )
+        logger.info(
+            "dcp project-before-merge: prepared full-group w_vc for %d MLA layers",
+            n_prepared,
+        )
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of

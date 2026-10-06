@@ -71,6 +71,7 @@ from sglang.srt.utils import BumpAllocator, get_bool_env_var
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _DCP_QREP_MIN_BS = envs.SGLANG_ROCM_DCP_QREP_MIN_BS.get()
+_DCP_PBM = envs.SGLANG_ROCM_DCP_PBM.get()
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -262,6 +263,76 @@ def rocm_absorb_q_bmm_qrep(
     return torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1).contiguous()
 
 
+def prepare_w_vc_dcp(attn: DeepseekV2AttentionMLA, dcp_group) -> bool:
+    """Build the full DCP-group ``w_vc_dcp`` for project-before-merge.
+
+    Same gather-dequantized-then-requantize scheme as ``prepare_w_kc_qrep_fp8``.
+    Returns False for weight formats the PBM bmm does not cover.
+    """
+    w_vc = attn.w_vc
+    if attn.use_deep_gemm_bmm or w_vc is None:
+        return False
+    if _use_aiter_gfx95 and w_vc.dtype == torch.float8_e4m3fn:
+        w_vc_full = dcp_group.all_gather(
+            (w_vc.to(torch.bfloat16) * attn.w_scale).contiguous(), dim=0
+        )
+        w_vc_dcp, attn.w_scale_vc_dcp = input_to_float8(
+            w_vc_full, dtype=torch.float8_e4m3fn
+        )
+    elif w_vc.dtype in (torch.bfloat16, torch.float16):
+        w_vc_dcp = dcp_group.all_gather(
+            _absorb_weight_bf16(w_vc, attn.w_scale).contiguous(), dim=0
+        )
+    else:
+        return False
+    # Same (H, L, V) view over (H, V, L) storage as w_vc.
+    attn.w_vc_dcp = w_vc_dcp.transpose(1, 2).contiguous().transpose(1, 2)
+    return True
+
+
+def rocm_dcp_pbm_active(attn: DeepseekV2AttentionMLA, dcp_comm_backend: str) -> bool:
+    return (
+        _DCP_PBM
+        and attn.w_vc_dcp is not None
+        and dcp_comm_backend in ("a2a", "fi_a2a")
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and not is_kv_b_lora_active(attn)
+    )
+
+
+def rocm_absorb_v_bmm_dcp(
+    attn: DeepseekV2AttentionMLA, attn_output: torch.Tensor
+) -> torch.Tensor:
+    """Full DCP-group ``attn_output @ w_vc_dcp`` -> ``[B, H * dcp, V]`` bf16."""
+    w_vc = attn.w_vc_dcp
+    num_heads, _, v_head_dim = w_vc.shape
+    out = torch.empty(
+        attn_output.shape[0],
+        num_heads,
+        v_head_dim,
+        device=attn_output.device,
+        dtype=torch.bfloat16,
+    )
+    if w_vc.dtype == torch.float8_e4m3fn:
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+            X=attn_output,
+            WQ=w_vc.transpose(-1, -2),
+            w_scale=attn.w_scale_vc_dcp,
+            group_size=128,
+            YQ=out,
+            transpose_bm=True,
+            transpose_bm_in=True,
+            dtype=torch.bfloat16,
+        )
+    else:
+        torch.bmm(
+            attn_output.to(torch.bfloat16).transpose(0, 1),
+            w_vc.to(torch.bfloat16),
+            out=out.transpose(0, 1),
+        )
+    return out
+
+
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
@@ -334,33 +405,7 @@ def rocm_absorb_v_bmm(
             )
 
     if _bmm_buf is not None:
-        # _bmm_buf is already (batch, heads, dim) contiguous
-        if attn.o_proj.weight.dtype == torch.uint8:
-            attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-        elif _is_block_scale_fp8(attn.o_proj):
-            # No-copy fp8 scale: emit the bpreshuffle scale already transposed and
-            # reinterpret it with a stride swap, instead of relaying out a copy.
-            # Falls back to the materialize (copy) path at M == 1 / non-gfx95.
-            _emit_bpre = emit_transposed_bpreshuffle_scale(
-                _bmm_buf.shape[0],
-                on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
-            )
-            attn_bmm_output = fused_flatten_fp8_group_quant(
-                _bmm_buf,
-                group_size=128,
-                dtype_quant=torch.float8_e4m3fn,
-                transpose_scale=_emit_bpre,
-            )
-            if _emit_bpre:
-                attn_bmm_output = view_aiter_fused_rms_transposed_fp8_scale_tuple(
-                    attn_bmm_output
-                )
-            elif _use_aiter_bpreshuffle_gfx95:
-                attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
-                    attn_bmm_output
-                )
-        else:
-            attn_bmm_output = _bmm_buf.flatten(1, 2)
+        attn_bmm_output = rocm_v_out_to_o_proj_input(attn, _bmm_buf)
     elif attn.o_proj.weight.dtype == torch.uint8:
         attn_bmm_output = attn_bmm_output.transpose(0, 1)
         attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
@@ -388,6 +433,82 @@ def rocm_absorb_v_bmm(
     else:
         attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
+    return attn_bmm_output
+
+
+def rocm_v_out_to_o_proj_input(attn: DeepseekV2AttentionMLA, v_out: torch.Tensor):
+    """Contiguous ``[B, H, V]`` bf16 -> o_proj input (flattened, quantized if needed)."""
+    if attn.o_proj.weight.dtype == torch.uint8:
+        return fused_flatten_mxfp4_quant(v_out)
+    if _is_block_scale_fp8(attn.o_proj):
+        # No-copy fp8 scale: emit the bpreshuffle scale already transposed and
+        # reinterpret it with a stride swap, instead of relaying out a copy.
+        # Falls back to the materialize (copy) path at M == 1 / non-gfx95.
+        _emit_bpre = emit_transposed_bpreshuffle_scale(
+            v_out.shape[0],
+            on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+        )
+        out = fused_flatten_fp8_group_quant(
+            v_out,
+            group_size=128,
+            dtype_quant=torch.float8_e4m3fn,
+            transpose_scale=_emit_bpre,
+        )
+        if _emit_bpre:
+            return view_aiter_fused_rms_transposed_fp8_scale_tuple(out)
+        if _use_aiter_bpreshuffle_gfx95:
+            return materialize_bpreshuffle_fp8_scale_tuple(out)
+        return out
+    return v_out.flatten(1, 2)
+
+
+def rocm_v_up_proj(attn: DeepseekV2AttentionMLA, attn_output: torch.Tensor):
+    """Merged latent ``[B, H, L]`` -> o_proj input via ``w_vc`` (+ kv_b LoRA)."""
+    attn_output = attn_output.view(-1, attn.num_local_heads, attn.kv_lora_rank)
+
+    _kvb_v = None
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
+        from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+            kv_b_lora_v_prepare,
+        )
+
+        _kvb_v = kv_b_lora_v_prepare(attn, attn_output)
+
+    if attn.use_deep_gemm_bmm:
+        (
+            attn_output_val,
+            attn_output_scale,
+            masked_m,
+            expected_m,
+            aligned_m,
+        ) = per_token_group_quant_mla_deep_gemm_masked_fp8(attn_output.transpose(0, 1))
+        attn_bmm_output = attn_output.new_empty(
+            (attn.num_local_heads, aligned_m, attn.v_head_dim)
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            (attn_output_val, attn_output_scale),
+            (attn.w_vc, attn.w_scale_v),
+            attn_bmm_output,
+            masked_m,
+            expected_m,
+        )
+        attn_bmm_output = (
+            attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
+        )
+    else:
+        attn_bmm_output = rocm_absorb_v_bmm(attn, attn_output)
+
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+            kv_b_lora_v_apply,
+        )
+
+        attn_bmm_output = kv_b_lora_v_apply(attn, attn_output, attn_bmm_output, _kvb_v)
+    elif is_kv_b_lora_active(attn):
+        attn_bmm_output = apply_kv_b_lora_v_correction(
+            attn, attn_output, attn_bmm_output
+        )
     return attn_bmm_output
 
 
@@ -990,6 +1111,7 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
+        pbm = False
         if is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
@@ -1008,6 +1130,12 @@ class DeepseekMLARocmForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
+                # w_vc is per-head linear and the merge a per-(token, head)
+                # weighted sum, so projecting first is exact and halves the
+                # merge payload when v_head_dim = kv_lora_rank / 2 (GLM-5).
+                pbm = rocm_dcp_pbm_active(self, dcp_comm_backend)
+                if pbm:
+                    attn_output = rocm_absorb_v_bmm_dcp(self, attn_output)
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
                     attn_output = dcp_a2a_lse_reduce(
@@ -1025,56 +1153,10 @@ class DeepseekMLARocmForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-
-        _kvb_v = None
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
-            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                kv_b_lora_v_prepare,
-            )
-
-            _kvb_v = kv_b_lora_v_prepare(self, attn_output)
-
-        if self.use_deep_gemm_bmm:
-            (
-                attn_output_val,
-                attn_output_scale,
-                masked_m,
-                expected_m,
-                aligned_m,
-            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
-                attn_output.transpose(0, 1)
-            )
-            attn_bmm_output = attn_output.new_empty(
-                (self.num_local_heads, aligned_m, self.v_head_dim)
-            )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (attn_output_val, attn_output_scale),
-                (self.w_vc, self.w_scale_v),
-                attn_bmm_output,
-                masked_m,
-                expected_m,
-            )
-            attn_bmm_output = (
-                attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
-            )
+        if pbm:
+            output, _ = self.o_proj(rocm_v_out_to_o_proj_input(self, attn_output))
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
-
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                kv_b_lora_v_apply,
-            )
-
-            attn_bmm_output = kv_b_lora_v_apply(
-                self, attn_output, attn_bmm_output, _kvb_v
-            )
-        elif is_kv_b_lora_active(self):
-            attn_bmm_output = apply_kv_b_lora_v_correction(
-                self, attn_output, attn_bmm_output
-            )
-        output, _ = self.o_proj(attn_bmm_output)
+            output, _ = self.o_proj(rocm_v_up_proj(self, attn_output))
 
         if self.next_skip_topk is None:
             return output

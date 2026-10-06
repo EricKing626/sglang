@@ -2151,6 +2151,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc_qrep = None
         self.w_scale_qrep = None
         self.q_b_proj_qrep_weight = None
+        # Full DCP-group w_vc for project-before-merge (ROCm DCP decode).
+        self.w_vc_dcp = None
+        self.w_scale_vc_dcp = None
 
         self.w_scale_k = None
         self.w_scale_v = None

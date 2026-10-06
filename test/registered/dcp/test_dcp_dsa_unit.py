@@ -301,6 +301,82 @@ class TestDcpQrepAbsorb(CustomTestCase):
             rel = (out - per_rank).norm() / per_rank.norm()
             self.assertLess(rel.item(), 3e-2)
 
+    @unittest.skipUnless(_aiter_gfx95(), "fp8 absorb kernel needs aiter on gfx950")
+    def test_project_before_merge_matches_merge_then_project(self):
+        from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+            forward_mla_rocm as rocm,
+        )
+
+        torch.manual_seed(0)
+        w, heads, lora, v_dim, bs = 4, 16, 512, 256, 8
+        w_vc = []
+        for r in range(w):
+            wv = torch.randn(heads, v_dim, lora, device="cuda") * (0.02 * (1 + r % 2))
+            wq, s = input_to_float8(wv.bfloat16(), dtype=torch.float8_e4m3fn)
+            w_vc.append((wq.transpose(1, 2), s))
+
+        def rank_fn(r):
+            attn = SimpleNamespace(
+                w_vc=w_vc[r][0], w_scale=w_vc[r][1], use_deep_gemm_bmm=False
+            )
+            self.assertTrue(rocm.prepare_w_vc_dcp(attn, self._group))
+            return attn
+
+        sends = []
+        for r in range(w):
+            self._group = _FakeGroup()
+            self._group._world = range(w)
+            rank_fn(r)
+            sends.append(self._group.sent)
+        attns = []
+        for r in range(w):
+            self._group = _FakeGroup(gathered=sends)
+            attns.append(rank_fn(r))
+
+        # Rank r's partial latent output over all W * heads heads, and its LSE.
+        o = torch.randn(w, bs, heads * w, lora, device="cuda").bfloat16()
+        lse = torch.randn(w, bs, heads * w, device="cuda")
+        weight = torch.softmax(lse, dim=0).unsqueeze(-1)
+        merged = (weight * o.float()).sum(0)
+        ref = torch.cat(
+            [
+                torch.bmm(
+                    merged[:, q * heads : (q + 1) * heads].transpose(0, 1),
+                    w_vc[q][0].float() * w_vc[q][1],
+                ).transpose(0, 1)
+                for q in range(w)
+            ],
+            dim=1,
+        )
+        for attn in attns:
+            self.assertEqual(attn.w_vc_dcp.shape, (heads * w, lora, v_dim))
+            self.assertTrue(attn.w_vc_dcp.transpose(-1, -2).is_contiguous())
+        projected = torch.stack(
+            [rocm.rocm_absorb_v_bmm_dcp(attns[r], o[r]).float() for r in range(w)]
+        )
+        self.assertEqual(projected.shape, (w, bs, heads * w, v_dim))
+        out = (weight * projected).sum(0)
+        # Merge-then-project through the same fp8 kernel with each rank's own
+        # w_vc: the error budget PBM has to stay within.
+        merge_first = torch.cat(
+            [
+                rocm.rocm_absorb_v_bmm_dcp(
+                    SimpleNamespace(w_vc_dcp=w_vc[q][0], w_scale_vc_dcp=w_vc[q][1]),
+                    merged[:, q * heads : (q + 1) * heads].bfloat16(),
+                ).float()
+                for q in range(w)
+            ],
+            dim=1,
+        )
+        rel = ((out - ref).norm() / ref.norm()).item()
+        rel_base = ((merge_first - ref).norm() / ref.norm()).item()
+        # The kernel takes one scalar w_scale, so the gathered w_vc is
+        # requantized to one scale and the ranks with a 2x smaller scale here
+        # lose precision; a layout bug would be off by O(1) instead.
+        self.assertLess(rel, 1.5 * rel_base, (rel, rel_base))
+        self.assertLess(rel, 5e-2)
+
 
 class TestDcpPrefillPageTable(CustomTestCase):
     def test_rows_follow_indptr(self):

@@ -904,6 +904,10 @@ class Envs:
     # --dcp-replicate-q-proj on ROCm: decode batches smaller than this keep the
     # per-layer Q all-gather, where it is cheaper than the full-head q_b_proj.
     SGLANG_ROCM_DCP_QREP_MIN_BS = EnvInt(32)
+    # DCP decode on ROCm: apply w_vc to each rank's partial output before the
+    # LSE merge (project-before-merge), so the merge moves v_head_dim instead
+    # of kv_lora_rank per head.
+    SGLANG_ROCM_DCP_PBM = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
