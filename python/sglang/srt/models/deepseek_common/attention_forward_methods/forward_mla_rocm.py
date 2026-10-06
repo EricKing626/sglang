@@ -30,6 +30,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
+    input_to_float8,
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
@@ -69,6 +70,7 @@ from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_DCP_QREP_MIN_BS = envs.SGLANG_ROCM_DCP_QREP_MIN_BS.get()
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -126,6 +128,7 @@ if _use_aiter:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
+    from aiter.tuned_gemm import tgemm
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
@@ -203,6 +206,60 @@ def rocm_absorb_q_bmm(
                 _absorb_weight_bf16(attn.w_kc, attn.w_scale),
             )
     return q_nope_out
+
+
+def prepare_w_kc_qrep_fp8(attn: DeepseekV2AttentionMLA, dcp_group) -> None:
+    """Build the full DCP-group fp8 ``w_kc_qrep`` / ``w_scale_qrep``.
+
+    Each rank quantized its own heads with its own per-tensor scale, so the fp8
+    shards cannot be concatenated as-is: gather them dequantized and requantize
+    the full head set with one scale.
+    """
+    w_kc_full = dcp_group.all_gather(
+        (attn.w_kc.to(torch.bfloat16) * attn.w_scale).contiguous(), dim=0
+    )
+    w_kc_qrep, attn.w_scale_qrep = input_to_float8(w_kc_full, dtype=torch.float8_e4m3fn)
+    # Same (H, K, N) view over (H, N, K) storage as w_kc.
+    attn.w_kc_qrep = w_kc_qrep.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def rocm_q_proj_qrep(attn: DeepseekV2AttentionMLA, x: torch.Tensor) -> torch.Tensor:
+    """Full DCP-group Q projection -> ``[B, H * dcp, qk_head_dim]``."""
+    if _use_aiter:
+        q = tgemm.mm(x, attn.q_b_proj_qrep_weight, None, otype=x.dtype)
+    else:
+        q = torch.nn.functional.linear(x, attn.q_b_proj_qrep_weight)
+    return q.view(
+        -1, attn.num_local_heads * get_parallel().attn_dcp_size, attn.qk_head_dim
+    )
+
+
+def rocm_absorb_q_bmm_qrep(
+    attn: DeepseekV2AttentionMLA, q_nope: torch.Tensor
+) -> torch.Tensor:
+    """Full DCP-group absorb ``q_nope @ w_kc_qrep`` -> ``[B, H * dcp, L]``."""
+    w_kc = attn.w_kc_qrep
+    if _use_aiter_gfx95 and w_kc.dtype == torch.float8_e4m3fn:
+        num_heads, _, kv_lora_rank = w_kc.shape
+        q_nope_out = torch.empty(
+            q_nope.shape[0],
+            num_heads,
+            kv_lora_rank,
+            device=q_nope.device,
+            dtype=torch.bfloat16,
+        )
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+            X=q_nope,
+            WQ=w_kc.transpose(-1, -2),
+            w_scale=attn.w_scale_qrep,
+            group_size=128,
+            YQ=q_nope_out,
+            transpose_bm=True,
+            transpose_bm_in=True,
+            dtype=torch.bfloat16,
+        )
+        return q_nope_out
+    return torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1).contiguous()
 
 
 def rocm_absorb_v_bmm(
@@ -463,6 +520,7 @@ class DeepseekMLARocmForwardMixin:
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
+            and forward_batch.batch_size >= _DCP_QREP_MIN_BS
         )
         q_lora = None
         topk_indices = None
@@ -552,13 +610,15 @@ class DeepseekMLARocmForwardMixin:
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
-                and not q_replicate_active
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
+                    if q_replicate_active:
+                        q = rocm_q_proj_qrep(self, q)
+                    else:
+                        q = self.q_b_proj_forward(q)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -577,11 +637,7 @@ class DeepseekMLARocmForwardMixin:
             else:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
-                        -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
-                        self.qk_head_dim,
-                    )
+                    q = rocm_q_proj_qrep(self, q)
                 else:
                     q = self.q_b_proj_forward(q)
 
@@ -600,13 +656,7 @@ class DeepseekMLARocmForwardMixin:
                         )
         else:
             if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
-                    -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
-                    self.qk_head_dim,
-                )
+                q = rocm_q_proj_qrep(self, hidden_states)
             else:
                 q = self.q_proj(hidden_states)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
@@ -622,11 +672,7 @@ class DeepseekMLARocmForwardMixin:
         )
 
         if q_replicate_active:
-            q_nope_out = (
-                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
-                .transpose(0, 1)
-                .contiguous()
-            )
+            q_nope_out = rocm_absorb_q_bmm_qrep(self, q_nope)
         else:
             _kvb_q = None
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:

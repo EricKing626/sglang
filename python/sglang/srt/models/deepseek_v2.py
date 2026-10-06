@@ -2149,6 +2149,7 @@ class DeepseekV2AttentionMLA(
         # Full-head Q/absorb weights for --dcp-replicate-q-proj, gathered once
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
+        self.w_scale_qrep = None
         self.q_b_proj_qrep_weight = None
 
         self.w_scale_k = None

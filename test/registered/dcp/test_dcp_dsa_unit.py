@@ -237,6 +237,71 @@ class TestDcpGatherIndexKPrefill(CustomTestCase):
         self._check(w=8, page_size=4, seq_lens=[3, 33, 64, 65])
 
 
+def _aiter_gfx95():
+    if not (torch.cuda.is_available() and torch.version.hip):
+        return False
+    from sglang.srt.utils import is_gfx95_supported
+
+    return is_gfx95_supported()
+
+
+class TestDcpQrepAbsorb(CustomTestCase):
+    @unittest.skipUnless(_aiter_gfx95(), "fp8 absorb kernel needs aiter on gfx950")
+    def test_fp8_w_kc_qrep_matches_per_rank(self):
+        from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+            forward_mla_rocm as rocm,
+        )
+
+        torch.manual_seed(0)
+        w, heads, nope, lora = 4, 16, 192, 512
+        ranks = []
+        for r in range(w):
+            wk = torch.randn(heads, nope, lora, device="cuda") * (0.02 * (1 + r % 2))
+            wq, s = input_to_float8(wk.bfloat16(), dtype=torch.float8_e4m3fn)
+            ranks.append(
+                SimpleNamespace(
+                    w_kc=wq.transpose(1, 2).contiguous().transpose(1, 2), w_scale=s
+                )
+            )
+
+        def rank_fn(r):
+            attn = SimpleNamespace(w_kc=ranks[r].w_kc, w_scale=ranks[r].w_scale)
+            rocm.prepare_w_kc_qrep_fp8(attn, self._group)
+            return attn
+
+        sends = []
+        for r in range(w):
+            self._group = _FakeGroup()
+            self._group._world = range(w)
+            rank_fn(r)
+            sends.append(self._group.sent)
+        attns = []
+        for r in range(w):
+            self._group = _FakeGroup(gathered=sends)
+            attns.append(rank_fn(r))
+
+        q_nope = torch.randn(8, heads * w, nope, device="cuda", dtype=torch.bfloat16)
+        per_rank = torch.cat(
+            [
+                rocm.rocm_absorb_q_bmm(
+                    ranks[r],
+                    q_nope[:, r * heads : (r + 1) * heads].contiguous(),
+                    is_capture_mode=True,
+                ).transpose(0, 1)
+                for r in range(w)
+            ],
+            dim=1,
+        ).float()
+        for attn in attns:
+            self.assertEqual(attn.w_kc_qrep.shape, (heads * w, nope, lora))
+            self.assertTrue(attn.w_kc_qrep.transpose(-1, -2).is_contiguous())
+            out = rocm.rocm_absorb_q_bmm_qrep(attn, q_nope).float()
+            self.assertEqual(out.shape, (8, heads * w, lora))
+            rel = (out - per_rank).norm() / per_rank.norm()
+            self.assertLess(rel.item(), 3e-2)
+
+
 class TestDcpPrefillPageTable(CustomTestCase):
     def test_rows_follow_indptr(self):
         seq_lens = torch.tensor([3, 1, 4])

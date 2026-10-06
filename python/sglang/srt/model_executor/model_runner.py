@@ -221,6 +221,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
+    is_hip,
     is_host_cpu_arm64,
     is_npu,
     require_gathered_buffer,
@@ -241,6 +242,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
@@ -1038,7 +1040,8 @@ class ModelRunner:
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
-        # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        # MLA decode path can skip the per-layer Q all-gather. q_b_proj must be
+        # bf16/fp16; w_kc may also be per-tensor fp8 e4m3fn on HIP (GLM gfx950).
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -1052,11 +1055,12 @@ class ModelRunner:
             if m.w_kc is None:
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            # q-replicate only supports the unquantized bf16/fp16 absorb path;
-            # quantized q-proj (packed weights) and non-16-bit w_kc keep the
-            # per-layer Q all-gather.
+            w_kc_fp8 = _is_hip and m.w_kc.dtype == torch.float8_e4m3fn
+            # q-replicate supports an unquantized bf16/fp16 q-proj with a
+            # bf16/fp16 or per-tensor fp8 w_kc; other layers keep the per-layer
+            # Q all-gather.
             if (
-                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
+                (m.w_kc.dtype not in (torch.bfloat16, torch.float16) and not w_kc_fp8)
                 or not isinstance(qp.quant_method, UnquantizedLinearMethod)
                 or qp.weight.dtype not in (torch.bfloat16, torch.float16)
             ):
@@ -1065,7 +1069,14 @@ class ModelRunner:
                     "(bf16/fp16 only); this layer keeps the Q all-gather."
                 )
                 continue
-            m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            if w_kc_fp8:
+                from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+                    prepare_w_kc_qrep_fp8,
+                )
+
+                prepare_w_kc_qrep_fp8(m, dcp_group)
+            else:
+                m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
             m.q_b_proj_qrep_weight = dcp_group.all_gather(
                 qp.weight.data.contiguous(), dim=0
             )
