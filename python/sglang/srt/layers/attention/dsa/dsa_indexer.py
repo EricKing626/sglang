@@ -47,6 +47,7 @@ from sglang.srt.layers.dcp.dsa import (
     dcp_gather_index_k_prefill,
     dcp_local_index_block_table,
     dcp_localize_write_loc,
+    dcp_owned_topk_all,
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
@@ -943,6 +944,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 local_lens,
                 self.index_topk,
                 metadata.topk_backend.topk_func,
+                metadata.get_page_table_1(),
             )
 
         if self.paged_mqa_logits_backend.is_aiter():
@@ -1352,6 +1354,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # MHA doesn't need topk_indices
         if not return_indices:
             return None
+
+        if (
+            get_parallel().dcp_enabled
+            and forward_batch.forward_mode.is_decode()
+            and topk_result is None
+        ):
+            return dcp_owned_topk_all(
+                metadata.get_seqlens_int32(),
+                self.index_topk,
+                metadata.get_page_table_1(),
+            )
 
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]

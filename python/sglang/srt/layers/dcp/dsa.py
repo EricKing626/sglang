@@ -17,16 +17,24 @@
 Owner rule matches the widened allocator: slot % W == rank, local row = slot // W.
 """
 
-from typing import Callable, List, Tuple
+from typing import Callable, List, NamedTuple, Tuple
 
 import torch
 
 from sglang.kernels.ops.attention.dcp_kernels import (
-    dcp_compact_owned_slots,
     dcp_topk_merge,
+    dcp_topk_owned_all,
     dcp_topk_pack,
 )
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.runtime_context import get_parallel
+
+
+class DcpOwnedTopk(NamedTuple):
+    """This rank's share of the global top-k, as the DCP sparse decode reads it."""
+
+    rows: torch.Tensor  # [bs, topk] int32 local KV rows, packed first, -1 tail
+    lens: torch.Tensor  # [bs] int32 number of owned rows
 
 
 def dcp_localize_write_loc(loc: torch.Tensor) -> torch.Tensor:
@@ -36,17 +44,6 @@ def dcp_localize_write_loc(loc: torch.Tensor) -> torch.Tensor:
         return loc
     w, r = parallel.attn_dcp_size, parallel.attn_dcp_rank
     return torch.where(loc % w == r, loc // w, torch.zeros_like(loc))
-
-
-def dcp_compact_read_table(
-    page_table_1: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Widened top-k slot table (-1 = invalid) -> (this rank's local rows packed
-    to the front with a -1 tail, per-row owned count)."""
-    parallel = get_parallel()
-    return dcp_compact_owned_slots(
-        page_table_1, parallel.attn_dcp_size, parallel.attn_dcp_rank
-    )
 
 
 def dcp_local_index_block_table(page_table_1: torch.Tensor, page_size: int):
@@ -64,10 +61,13 @@ def dcp_exchange_topk(
     local_lens: torch.Tensor,
     topk: int,
     topk_func: Callable,
-) -> torch.Tensor:
-    """Local top-k -> all-gather (score, global pos) -> global top-k (-1 padded).
+    page_table_1: torch.Tensor,
+) -> DcpOwnedTopk:
+    """Local top-k -> all-gather scores -> this rank's share of the global top-k.
 
-    A token in the global top-k is in its owner's local top-k, so the merge is exact.
+    A token in the global top-k is in its owner's local top-k, so the merge is
+    exact. ``page_table_1`` maps positions to widened slots; local position j of
+    rank r is global position j * W + r.
     """
     parallel = get_parallel()
     w, r = parallel.attn_dcp_size, parallel.attn_dcp_rank
@@ -78,25 +78,46 @@ def dcp_exchange_topk(
         )
     local_idx = topk_func(local_logits, local_lens, topk)
     if local_logits.is_cuda:
-        send = dcp_topk_pack(local_logits, local_idx, local_lens, w, r)
+        send = dcp_topk_pack(local_logits, local_idx, local_lens)
         recv = parallel.dcp_group.all_gather(send, dim=0)
-        return dcp_topk_merge(recv, w, topk_func)
+        return DcpOwnedTopk(
+            *dcp_topk_merge(recv, local_idx, local_lens, page_table_1, w, r, topk_func)
+        )
 
     valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
     safe_idx = torch.where(valid, local_idx, torch.zeros_like(local_idx)).long()
-    send = torch.empty((2, rows, topk), dtype=torch.float32, device=local_logits.device)
-    send[0] = torch.where(
-        valid, local_logits.gather(1, safe_idx), torch.full_like(send[0], -float("inf"))
+    send = torch.where(
+        valid, local_logits.gather(1, safe_idx), torch.tensor(-float("inf"))
+    ).float()
+    recv = parallel.dcp_group.all_gather(send, dim=0)
+    scores = recv.view(w, rows, topk).permute(1, 0, 2).reshape(rows, w * topk)
+    _, pick = torch.topk(scores, topk, dim=1)
+    col = pick - r * topk
+    mine = (col >= 0) & (col < topk)
+    col = col.clamp(0, topk - 1)
+    owned = mine & valid.gather(1, col)
+    pos = (safe_idx.gather(1, col) * w + r).clamp(max=page_table_1.shape[1] - 1)
+    local_rows = torch.where(owned, page_table_1.long().gather(1, pos) // w, -1)
+    order = torch.sort((~owned).int(), dim=1, stable=True).indices
+    return DcpOwnedTopk(
+        local_rows.gather(1, order).int(), owned.sum(dim=1, dtype=torch.int32)
     )
-    # Pack the global position as int32 bits so one collective moves both planes.
-    send.view(torch.int32)[1] = torch.where(valid, local_idx * w + r, -1)
-    # Gather as fp32 (bit-exact) so ROCm can use the custom all-gather.
-    recv = parallel.dcp_group.all_gather(send, dim=0).view(torch.int32)
-    recv = recv.view(w, 2, rows, topk).permute(2, 1, 0, 3).reshape(rows, 2, w * topk)
-    scores = recv[:, 0].contiguous().view(torch.float32)
-    best, pick = torch.topk(scores, topk, dim=1)
-    gids = recv[:, 1].gather(1, pick)
-    return torch.where(best > -float("inf"), gids, -1).to(torch.int32)
+
+
+def dcp_owned_topk_all(
+    seq_lens: torch.Tensor, topk: int, page_table_1: torch.Tensor
+) -> DcpOwnedTopk:
+    """The ``kv_len <= topk`` shortcut: every token is selected, so no exchange."""
+    parallel = get_parallel()
+    w, r = parallel.attn_dcp_size, parallel.attn_dcp_rank
+    local_lens = get_dcp_lens(seq_lens, w, r).to(torch.int32)
+    if page_table_1.is_cuda:
+        return DcpOwnedTopk(*dcp_topk_owned_all(local_lens, page_table_1, topk, w, r))
+    local = torch.arange(topk, device=page_table_1.device)
+    owned = local < local_lens.view(-1, 1)
+    pos = (local * w + r).clamp(max=page_table_1.shape[1] - 1)
+    local_rows = torch.where(owned, page_table_1.long()[:, pos] // w, -1)
+    return DcpOwnedTopk(local_rows.int(), local_lens)
 
 
 def dcp_gather_index_k_prefill(

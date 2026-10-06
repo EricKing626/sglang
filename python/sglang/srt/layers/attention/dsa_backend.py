@@ -83,7 +83,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.layers.dcp.dsa import dcp_compact_read_table, dcp_prefill_page_table
+from sglang.srt.layers.dcp.dsa import DcpOwnedTopk, dcp_prefill_page_table
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -2297,6 +2297,13 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        if get_parallel().dcp_enabled and not forward_batch.forward_mode.is_idle():
+            # The DCP indexer already resolved this rank's share of the top-k.
+            assert isinstance(topk_indices, DcpOwnedTopk)
+            if q_all is None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_decode_dcp(q_all, kv_cache, topk_indices, layer)
+
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2316,11 +2323,6 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
-
-        if get_parallel().dcp_enabled and not forward_batch.forward_mode.is_idle():
-            if q_all is None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
-            return self._forward_decode_dcp(q_all, kv_cache, page_table_1, layer)
 
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -3025,12 +3027,12 @@ class DeepseekSparseAttnBackend(
         self,
         q_all: torch.Tensor,
         kv_cache: torch.Tensor,
-        page_table_1: torch.Tensor,
+        owned: DcpOwnedTopk,
         layer: RadixAttention,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Attend this rank's share of the global top-k -> (out, natural-log lse).
 
-        Owned slots are packed to the front so the split-K kernel only walks
+        Owned rows are packed to the front so the split-K kernel only walks
         about topk / W of them. A row this rank owns nothing of comes back with
         zero output and a large negative LSE, so it drops out of the merge.
         """
@@ -3040,7 +3042,7 @@ class DeepseekSparseAttnBackend(
 
         assert self.dsa_index_kpool <= 1, "DSA + DCP does not support index kpool"
         q_all = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
-        local_table, local_lens = dcp_compact_read_table(page_table_1)
+        local_table, local_lens = owned
         out, lse = triton_sparse_mla_decode_splitk(
             q_nope=q_all[:, :, : layer.v_head_dim],
             q_rope=q_all[:, :, layer.v_head_dim :],

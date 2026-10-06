@@ -86,26 +86,6 @@ class TestDcpLocalize(CustomTestCase):
         with patch.object(dcp_dsa, "get_parallel", return_value=_parallel(1, 0)):
             self.assertIs(dcp_dsa.dcp_localize_write_loc(loc), loc)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "Triton kernel needs a GPU")
-    def test_compact_read_table(self):
-        table = torch.tensor(
-            [[0, 5, 9, -1, 12, 3], [7, -1, -1, 2, 8, 15]], device="cuda"
-        )
-        w = 4
-        n_owned = 0
-        for r in range(w):
-            with patch.object(dcp_dsa, "get_parallel", return_value=_parallel(w, r)):
-                local, lens = dcp_dsa.dcp_compact_read_table(table)
-            self.assertEqual(local.dtype, torch.int32)
-            for b in range(table.shape[0]):
-                row = table[b]
-                ref = (row[(row >= 0) & (row % w == r)] // w).int()
-                n = int(lens[b])
-                self.assertTrue(torch.equal(local[b, :n], ref))
-                self.assertTrue(torch.all(local[b, n:] == -1))
-                n_owned += n
-        self.assertEqual(n_owned, int((table >= 0).sum()))
-
     def test_local_index_block_table(self):
         for page_size in (1, 4, 64):
             w = 4
@@ -125,6 +105,16 @@ class TestDcpLocalize(CustomTestCase):
                 )
 
 
+def _shuffled_page_table(rows, local_width, w, g):
+    """Widened pages of W slots in shuffled order: position p of row b sits at
+    slot page * W + p % W, so its owner is p % W."""
+    pages = torch.randperm(rows * local_width, generator=g) + 1
+    pos = torch.arange(local_width * w)
+    return torch.stack(
+        [pages[b * local_width + pos // w] * w + pos % w for b in range(rows)]
+    ).int()
+
+
 class TestDcpExchangeTopk(CustomTestCase):
     def _check(self, w, seq_lens, topk, seed=0, device="cpu"):
         g = torch.Generator().manual_seed(seed)
@@ -133,29 +123,46 @@ class TestDcpExchangeTopk(CustomTestCase):
         global_logits = torch.randn((rows, max_len), generator=g)
         lens = torch.tensor(seq_lens, dtype=torch.int32)
         backend = DSATopKBackend.TORCH if device == "cpu" else DSATopKBackend.SGL_KERNEL
+
+        def topk_func(score, lengths, k):
+            # Each rank runs twice here (record sends, then gather), and the merge
+            # reads this rank's local top-k by its position in the send. Pin
+            # fast_topk_v2's unspecified output order so both runs agree.
+            return backend.topk_func(score, lengths, k).sort(dim=1).values
+
         local_width = (max_len + w - 1) // w
+        page_table = _shuffled_page_table(rows, local_width, w, g)
 
         def rank_fn(r):
             local = torch.full((rows, local_width), float("nan"))
             pos = torch.arange(r, max_len, w)
             local[:, : pos.numel()] = global_logits[:, pos]
             local_lens = torch.clamp((lens - r + w - 1) // w, min=0).int()
-            return dcp_dsa.dcp_exchange_topk(
-                local.to(device), local_lens.to(device), topk, backend.topk_func
-            ).cpu()
+            out = dcp_dsa.dcp_exchange_topk(
+                local.to(device),
+                local_lens.to(device),
+                topk,
+                topk_func,
+                page_table.to(device),
+            )
+            return out.rows.cpu(), out.lens.cpu()
 
-        # Selection order is unspecified (fast_topk_v2 is unordered); sets must agree.
-        outs = [o.sort(dim=1).values for o in _run_collective(w, rank_fn)]
-        for out in outs[1:]:
-            self.assertTrue(torch.equal(out, outs[0]))
-        out = outs[0]
-        self.assertEqual(out.shape, (rows, topk))
+        outs = _run_collective(w, rank_fn)
         for b, n in enumerate(seq_lens):
             k = min(topk, n)
-            ref = torch.topk(global_logits[b, :n], k).indices.sort().values
-            got = out[b][out[b] >= 0].sort().values
-            self.assertTrue(torch.equal(got.long(), ref), f"row {b}")
-            self.assertEqual(int((out[b] < 0).sum()), topk - k)
+            ref_pos = torch.topk(global_logits[b, :n], k).indices
+            n_owned = 0
+            for r, (local_rows, local_lens) in enumerate(outs):
+                self.assertEqual(local_rows.shape, (rows, topk))
+                owned = ref_pos[ref_pos % w == r]
+                ref = (page_table[b, owned] // w).sort().values
+                m = int(local_lens[b])
+                # Selection order is unspecified (fast_topk_v2 is unordered).
+                got = local_rows[b, :m].sort().values
+                self.assertTrue(torch.equal(got, ref), f"row {b} rank {r}")
+                self.assertTrue(torch.all(local_rows[b, m:] == -1))
+                n_owned += m
+            self.assertEqual(n_owned, k)
 
     def test_long_rows(self):
         self._check(w=4, seq_lens=[300, 257, 1000], topk=64)
@@ -173,6 +180,28 @@ class TestDcpExchangeTopk(CustomTestCase):
         self._check(w=4, seq_lens=[300, 2047, 1000, 3], topk=2048, device="cuda")
         self._check(w=4, seq_lens=[9000, 20, 2049], topk=2048, device="cuda")
         self._check(w=8, seq_lens=[2048, 5, 40000], topk=2048, seed=1, device="cuda")
+
+    def test_short_context_selects_all(self):
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for w, seq_lens in ((4, [1, 3, 2048, 700]), (8, [2045, 9])):
+                topk = 2048
+                g = torch.Generator().manual_seed(w)
+                page_table = _shuffled_page_table(len(seq_lens), topk // w, w, g)
+                lens = torch.tensor(seq_lens, dtype=torch.int32)
+                for r in range(w):
+                    with patch.object(
+                        dcp_dsa, "get_parallel", return_value=_parallel(w, r)
+                    ):
+                        out = dcp_dsa.dcp_owned_topk_all(
+                            lens.to(device), topk, page_table.to(device)
+                        )
+                    for b, n in enumerate(seq_lens):
+                        ref = page_table[b, r:n:w] // w
+                        m = int(out.lens[b])
+                        self.assertEqual(m, ref.numel(), f"{device} row {b} rank {r}")
+                        self.assertTrue(torch.equal(out.rows[b, :m].cpu(), ref))
+                        self.assertTrue(torch.all(out.rows[b, m:] == -1))
 
 
 class _FakeIndexPool:
