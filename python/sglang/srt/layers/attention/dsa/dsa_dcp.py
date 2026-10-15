@@ -138,6 +138,39 @@ def dcp_use_split_indexer(
     return keys >= envs.SGLANG_DCP_DSA_SPLIT_INDEXER_MIN_KV.get() * tokens
 
 
+def dcp_use_gathered_prefill(
+    extend_prefix_lens_cpu: List[int], extend_num_tokens: int, gathered_heads: int
+) -> bool:
+    """Whether a DCP prefill all-gathers the cached prefix KV and attends with
+    this rank's heads, instead of all-gathering Q and LSE-merging owned slots.
+
+    The gathered path moves one latent per prefix token; the owned path moves
+    every extend token's Q for all heads plus the head partials back. The
+    prefix all-gather reads position p from rank p % W, so every prefix must
+    be a whole number of widened pages.
+    """
+    w = get_parallel().dcp_group.world_size
+    if any(p % w for p in extend_prefix_lens_cpu):
+        return False
+    ratio = envs.SGLANG_DCP_DSA_OWNED_PREFILL_RATIO.get()
+    if ratio < 0:
+        return True
+    return sum(extend_prefix_lens_cpu) < ratio * gathered_heads * extend_num_tokens
+
+
+def dcp_gathered_page_table(
+    dcp_kv_indptr: torch.Tensor,
+    dcp_kv_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    """[bs, width] sequence position -> row of the all-gathered ``dcp_kv_buffer``."""
+    cols = torch.arange(width, device=seq_lens.device)
+    valid = cols < seq_lens[:, None]
+    flat = torch.where(valid, dcp_kv_indptr[:-1, None].long() + cols, 0)
+    return torch.where(valid, dcp_kv_indices[flat], 0).to(torch.int32)
+
+
 def dcp_split_rows(rows: int) -> Tuple[int, int, int]:
     """This rank's slice [lo, hi) of ``rows`` and the per-rank padded count."""
     group = get_parallel().dcp_group
