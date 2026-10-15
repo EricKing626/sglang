@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
@@ -9,6 +9,8 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 TRTLLM_MAX_BATCH_ROWS = 65535
 # FlashInfer carves heads * rows * 256 float2 softmax slots out of the workspace per call;
@@ -116,3 +118,38 @@ def dcp_trtllm_sparse_attention(
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse
+
+
+def dcp_use_split_indexer(
+    extend_prefix_lens_cpu: List[int], extend_seq_lens_cpu: List[int]
+) -> bool:
+    """Whether the replicated index K lets the DCP group split the prefill rows.
+
+    Splitting saves (W - 1) / W of the logits and top-k, which grow with each
+    query token's key length, for a fixed topk-wide int32 all-gather per token.
+    """
+    tokens = sum(extend_seq_lens_cpu)
+    if tokens == 0:
+        return False
+    keys = sum(
+        e * p + e * (e + 1) // 2
+        for p, e in zip(extend_prefix_lens_cpu, extend_seq_lens_cpu)
+    )
+    return keys >= envs.SGLANG_DCP_DSA_SPLIT_INDEXER_MIN_KV.get() * tokens
+
+
+def dcp_split_rows(rows: int) -> Tuple[int, int, int]:
+    """This rank's slice [lo, hi) of ``rows`` and the per-rank padded count."""
+    group = get_parallel().dcp_group
+    per = -(-rows // group.world_size)
+    lo = min(group.rank_in_group * per, rows)
+    return lo, min(lo + per, rows), per
+
+
+def dcp_all_gather_rows(part: torch.Tensor, rows: int, per: int) -> torch.Tensor:
+    """Inverse of ``dcp_split_rows``: every rank's slice, back in row order."""
+    send = part
+    if part.shape[0] != per:
+        send = part.new_full((per,) + tuple(part.shape[1:]), -1)
+        send[: part.shape[0]] = part
+    return get_parallel().dcp_group.all_gather(send, dim=0)[:rows]

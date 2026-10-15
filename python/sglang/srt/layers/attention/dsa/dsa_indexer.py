@@ -21,6 +21,11 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import (
+    dcp_all_gather_rows,
+    dcp_split_rows,
+    dcp_use_split_indexer,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
@@ -1541,14 +1546,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        # Every DCP rank holds the whole index K: score 1/W of the rows each, then
+        # all-gather the top-k.
+        split = (
+            _is_hip
+            and getattr(metadata, "dcp_size", 1) > 1
+            and dcp_use_split_indexer(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            )
+        )
+        if split:
+            row_lo, row_hi, row_per = dcp_split_rows(q_offset)
+        else:
+            row_lo, row_hi = 0, q_offset
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
-            num_rows=q_offset,
+            num_rows=row_hi - row_lo,
             num_cols=k_offset,
             get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
             rocm=_is_hip,
         )
 
-        if not need_chunk:
+        if not need_chunk and not split:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
@@ -1597,9 +1616,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
-        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
-        max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
-        max_rows = min(max_rows, q_offset)
+        max_rows = max(1, row_hi - row_lo)
+        if need_chunk:
+            bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+            max_rows = min(max_rows, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
         cu_seqlens_q_full = None
@@ -1614,9 +1635,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
             )
 
-        start = 0
-        while start < q_offset:
-            end = min(start + max_rows, q_offset)
+        start = row_lo
+        while start < row_hi:
+            end = min(start + max_rows, row_hi)
 
             with self._with_real_sm_count():
                 if _is_hip:
@@ -1682,6 +1703,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result[start:end] = raw_topk_chunk
             start = end
 
+        if split:
+            topk_result[:q_offset] = dcp_all_gather_rows(
+                topk_result[row_lo:row_hi], q_offset, row_per
+            )
         return topk_result
 
     def _forward_cuda_k_only(
